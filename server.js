@@ -17,21 +17,133 @@ const upload=multer({storage,limits:{fileSize:5*1024*1024},fileFilter:(req,file,
 app.use(cors());app.use(express.json());app.use(express.urlencoded({extended:true}));app.use(express.static(path.join(__dirname,'public')));
 
 async function init(){
- await pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name VARCHAR(120) NOT NULL,email VARCHAR(180) UNIQUE NOT NULL,phone VARCHAR(30),password_hash TEXT NOT NULL,role VARCHAR(20) NOT NULL CHECK(role IN ('buyer','seller','admin')),created_at TIMESTAMPTZ DEFAULT NOW());
+ await pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name VARCHAR(120) NOT NULL,email VARCHAR(180) UNIQUE NOT NULL,phone VARCHAR(30),password_hash TEXT NOT NULL,role VARCHAR(20) NOT NULL CHECK(role IN ('buyer','seller','admin')),profile_photo TEXT,address TEXT,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS products(id SERIAL PRIMARY KEY,seller_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name VARCHAR(220) NOT NULL,description TEXT,category VARCHAR(80) NOT NULL,price NUMERIC(12,2) NOT NULL CHECK(price>=0),old_price NUMERIC(12,2),stock INT NOT NULL DEFAULT 0 CHECK(stock>=0),image TEXT,rating NUMERIC(2,1) DEFAULT 4.3,active BOOLEAN DEFAULT TRUE,created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS orders(id SERIAL PRIMARY KEY,order_number VARCHAR(40) UNIQUE NOT NULL,buyer_id INT NOT NULL REFERENCES users(id),total NUMERIC(12,2) NOT NULL,shipping_name VARCHAR(120) NOT NULL,shipping_phone VARCHAR(30) NOT NULL,shipping_address TEXT NOT NULL,payment_method VARCHAR(30) NOT NULL DEFAULT 'COD',created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS seller_orders(id SERIAL PRIMARY KEY,order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,seller_id INT NOT NULL REFERENCES users(id),total NUMERIC(12,2) NOT NULL,status VARCHAR(30) NOT NULL DEFAULT 'Confirmed',created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS order_items(id SERIAL PRIMARY KEY,seller_order_id INT NOT NULL REFERENCES seller_orders(id) ON DELETE CASCADE,product_id INT NOT NULL REFERENCES products(id),product_name VARCHAR(220) NOT NULL,price NUMERIC(12,2) NOT NULL,quantity INT NOT NULL CHECK(quantity>0));
  CREATE INDEX IF NOT EXISTS idx_products_seller ON products(seller_id); CREATE INDEX IF NOT EXISTS idx_seller_orders_seller ON seller_orders(seller_id);`);
+ await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_photo TEXT; ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT; ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
+ await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone <> '';`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS otp_challenges(id SERIAL PRIMARY KEY,user_id INT REFERENCES users(id) ON DELETE CASCADE,phone VARCHAR(30) NOT NULL,purpose VARCHAR(30) NOT NULL CHECK(purpose IN ('login','reset')),code_hash TEXT,provider_sid TEXT,attempts INT NOT NULL DEFAULT 0,expires_at TIMESTAMPTZ NOT NULL,verified_at TIMESTAMPTZ,created_at TIMESTAMPTZ DEFAULT NOW()); CREATE INDEX IF NOT EXISTS idx_otp_phone_purpose ON otp_challenges(phone,purpose,created_at DESC);`);
 }
 function tokenFor(u){return jwt.sign({id:u.id,role:u.role,name:u.name,email:u.email},process.env.JWT_SECRET||'dev-secret-change-me',{expiresIn:'7d'})}
 function auth(req,res,next){try{const h=req.headers.authorization||'';if(!h.startsWith('Bearer '))return res.status(401).json({error:'Login required'});req.user=jwt.verify(h.slice(7),process.env.JWT_SECRET||'dev-secret-change-me');next()}catch(e){res.status(401).json({error:'Invalid or expired login'})}}
 function role(...roles){return (req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:'Not allowed'})}
 const q=(text,params)=>pool.query(text,params);
+function normalizePhone(value){
+  let p=String(value||'').trim().replace(/[\s()-]/g,'');
+  if(/^\d{10}$/.test(p)) p='+91'+p;
+  if(/^0\d{10}$/.test(p)) p='+91'+p.slice(1);
+  return p;
+}
+function safeUser(u){return {id:u.id,name:u.name,email:u.email,phone:u.phone||'',role:u.role,profile_photo:u.profile_photo||'',address:u.address||'',created_at:u.created_at};}
+async function sendOtp(phone){
+  const sid=process.env.TWILIO_ACCOUNT_SID, token=process.env.TWILIO_AUTH_TOKEN, service=process.env.TWILIO_VERIFY_SERVICE_SID;
+  if(!sid||!token||!service) throw new Error('SMS OTP is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID in Render.');
+  const auth=Buffer.from(`${sid}:${token}`).toString('base64');
+  const body=new URLSearchParams({To:phone,Channel:'sms'});
+  const r=await fetch(`https://verify.twilio.com/v2/Services/${service}/Verifications`,{method:'POST',headers:{Authorization:`Basic ${auth}`,'Content-Type':'application/x-www-form-urlencoded'},body});
+  const d=await r.json();
+  if(!r.ok) throw new Error(d.message||'Unable to send OTP');
+  return d.sid;
+}
+async function checkOtp(phone,code){
+  const sid=process.env.TWILIO_ACCOUNT_SID, token=process.env.TWILIO_AUTH_TOKEN, service=process.env.TWILIO_VERIFY_SERVICE_SID;
+  if(!sid||!token||!service) throw new Error('SMS OTP is not configured.');
+  const auth=Buffer.from(`${sid}:${token}`).toString('base64');
+  const body=new URLSearchParams({To:phone,Code:String(code||'')});
+  const r=await fetch(`https://verify.twilio.com/v2/Services/${service}/VerificationCheck`,{method:'POST',headers:{Authorization:`Basic ${auth}`,'Content-Type':'application/x-www-form-urlencoded'},body});
+  const d=await r.json();
+  if(!r.ok) throw new Error(d.message||'OTP verification failed');
+  return d.status==='approved';
+}
+function requireBuyer(req,res,next){return role('buyer','admin')(req,res,next)}
 
-app.post('/api/auth/register',async(req,res)=>{try{const {name,email,password,phone,role='buyer'}=req.body;if(!name||!email||!password)return res.status(400).json({error:'Name, email and password are required'});if(!['buyer','seller'].includes(role))return res.status(400).json({error:'Invalid role'});const hash=await bcrypt.hash(password,12);const r=await q('INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,phone,role',[name,email.toLowerCase(),phone||'',hash,role]);res.json({user:r.rows[0],token:tokenFor(r.rows[0])})}catch(e){res.status(400).json({error:e.code==='23505'?'Email already registered':e.message})}});
-app.post('/api/auth/login',async(req,res)=>{try{const {email,password}=req.body;const r=await q('SELECT * FROM users WHERE email=$1',[String(email||'').toLowerCase()]);if(!r.rows[0]||!(await bcrypt.compare(password||'',r.rows[0].password_hash)))return res.status(401).json({error:'Invalid email or password'});const u=r.rows[0];res.json({user:{id:u.id,name:u.name,email:u.email,phone:u.phone,role:u.role},token:tokenFor(u)})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/auth/me',auth,async(req,res)=>{const r=await q('SELECT id,name,email,phone,role FROM users WHERE id=$1',[req.user.id]);res.json({user:r.rows[0]})});
+app.post('/api/auth/register',async(req,res)=>{try{
+ const {name,email,password,phone,role='buyer'}=req.body;
+ if(!name||!email||!password)return res.status(400).json({error:'Name, email and password are required'});
+ if(!['buyer','seller'].includes(role))return res.status(400).json({error:'Invalid role'});
+ const normalizedEmail=String(email).trim().toLowerCase();
+ const normalizedPhone=normalizePhone(phone);
+ if(role==='buyer' && !/^\+\d{8,15}$/.test(normalizedPhone))return res.status(400).json({error:'Enter a valid mobile number'});
+ const hash=await bcrypt.hash(password,12);
+ const r=await q('INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,phone,role,profile_photo,address,created_at',[String(name).trim(),normalizedEmail,normalizedPhone||'',hash,role]);
+ res.json({user:safeUser(r.rows[0]),token:tokenFor(r.rows[0])});
+}catch(e){res.status(400).json({error:e.code==='23505'?(String(e.constraint||'').includes('phone')?'Mobile number already registered':'Email already registered'):e.message})}});
+
+app.post('/api/auth/login',async(req,res)=>{try{
+ const {identifier,password}=req.body; const value=String(identifier||'').trim();
+ const normalizedPhone=normalizePhone(value);
+ const r=await q('SELECT * FROM users WHERE lower(email)=lower($1) OR phone=$2 LIMIT 1',[value,normalizedPhone]);
+ if(!r.rows[0]||!(await bcrypt.compare(password||'',r.rows[0].password_hash)))return res.status(401).json({error:'Invalid email/mobile number or password'});
+ const u=r.rows[0];res.json({user:safeUser(u),token:tokenFor(u)});
+}catch(e){res.status(500).json({error:e.message})}});
+
+app.post('/api/auth/otp/request',async(req,res)=>{try{
+ const phone=normalizePhone(req.body.phone);
+ if(!/^\+\d{8,15}$/.test(phone))return res.status(400).json({error:'Enter a valid mobile number'});
+ const r=await q("SELECT * FROM users WHERE phone=$1 AND role='buyer' LIMIT 1",[phone]);
+ if(!r.rows[0])return res.status(404).json({error:'No buyer account is linked to this mobile number'});
+ const sid=await sendOtp(phone);
+ await q("INSERT INTO otp_challenges(user_id,phone,purpose,provider_sid,expires_at) VALUES($1,$2,'login',$3,NOW()+INTERVAL '10 minutes')",[r.rows[0].id,phone,sid]);
+ res.json({ok:true,message:'OTP sent to your mobile number'});
+}catch(e){res.status(400).json({error:e.message})}});
+
+app.post('/api/auth/otp/login',async(req,res)=>{try{
+ const phone=normalizePhone(req.body.phone), code=String(req.body.code||'');
+ if(!/^\+\d{8,15}$/.test(phone)||!/^\d{4,8}$/.test(code))return res.status(400).json({error:'Enter a valid mobile number and OTP'});
+ const ok=await checkOtp(phone,code); if(!ok)return res.status(401).json({error:'Invalid or expired OTP'});
+ const r=await q("SELECT * FROM users WHERE phone=$1 AND role='buyer' LIMIT 1",[phone]); if(!r.rows[0])return res.status(404).json({error:'Buyer account not found'});
+ const u=r.rows[0]; await q("UPDATE otp_challenges SET verified_at=NOW() WHERE phone=$1 AND purpose='login' AND verified_at IS NULL",[phone]);
+ res.json({user:safeUser(u),token:tokenFor(u)});
+}catch(e){res.status(400).json({error:e.message})}});
+
+app.post('/api/auth/password-reset/request',async(req,res)=>{try{
+ const value=String(req.body.identifier||'').trim(); const phone=normalizePhone(value);
+ const r=await q("SELECT * FROM users WHERE (lower(email)=lower($1) OR phone=$2) AND role='buyer' LIMIT 1",[value,phone]);
+ if(!r.rows[0])return res.status(404).json({error:'Buyer account not found'});
+ if(!r.rows[0].phone)return res.status(400).json({error:'No mobile number is linked to this account'});
+ const sid=await sendOtp(r.rows[0].phone);
+ await q("INSERT INTO otp_challenges(user_id,phone,purpose,provider_sid,expires_at) VALUES($1,$2,'reset',$3,NOW()+INTERVAL '10 minutes')",[r.rows[0].id,r.rows[0].phone,sid]);
+ res.json({ok:true,message:'Password reset OTP sent to your linked mobile number',phone:r.rows[0].phone});
+}catch(e){res.status(400).json({error:e.message})}});
+
+app.post('/api/auth/password-reset/confirm',async(req,res)=>{try{
+ const phone=normalizePhone(req.body.phone),code=String(req.body.code||''),newPassword=String(req.body.newPassword||'');
+ if(newPassword.length<6)return res.status(400).json({error:'Password must be at least 6 characters'});
+ const ok=await checkOtp(phone,code); if(!ok)return res.status(401).json({error:'Invalid or expired OTP'});
+ const r=await q("SELECT * FROM users WHERE phone=$1 AND role='buyer' LIMIT 1",[phone]); if(!r.rows[0])return res.status(404).json({error:'Buyer account not found'});
+ const hash=await bcrypt.hash(newPassword,12); await q('UPDATE users SET password_hash=$1,updated_at=NOW() WHERE id=$2',[hash,r.rows[0].id]);
+ await q("UPDATE otp_challenges SET verified_at=NOW() WHERE phone=$1 AND purpose='reset' AND verified_at IS NULL",[phone]);
+ res.json({ok:true,message:'Password changed successfully. You can now log in.'});
+}catch(e){res.status(400).json({error:e.message})}});
+
+app.get('/api/auth/me',auth,async(req,res)=>{const r=await q('SELECT id,name,email,phone,role,profile_photo,address,created_at FROM users WHERE id=$1',[req.user.id]);if(!r.rows[0])return res.status(404).json({error:'User not found'});res.json({user:safeUser(r.rows[0])})});
+
+app.put('/api/auth/profile',auth,async(req,res)=>{try{
+ const {name,email,phone,address}=req.body; const normalizedEmail=String(email||'').trim().toLowerCase(); const normalizedPhone=normalizePhone(phone);
+ if(!name||!normalizedEmail)return res.status(400).json({error:'Name and email are required'});
+ if(req.user.role==='buyer'&&!/^\+\d{8,15}$/.test(normalizedPhone))return res.status(400).json({error:'Enter a valid mobile number'});
+ const r=await q('UPDATE users SET name=$1,email=$2,phone=$3,address=$4,updated_at=NOW() WHERE id=$5 RETURNING id,name,email,phone,role,profile_photo,address,created_at',[String(name).trim(),normalizedEmail,normalizedPhone||'',String(address||'').trim(),req.user.id]);
+ res.json({user:safeUser(r.rows[0]),token:tokenFor(r.rows[0])});
+}catch(e){res.status(400).json({error:e.code==='23505'?(String(e.constraint||'').includes('phone')?'Mobile number already registered':'Email already registered'):e.message})}});
+
+app.post('/api/auth/profile-photo',auth,upload.single('photo'),async(req,res)=>{try{
+ if(!req.file)return res.status(400).json({error:'Please select an image'});
+ const ext=path.extname(req.file.originalname).toLowerCase(); const mime=req.file.mimetype;
+ const data=fs.readFileSync(req.file.path); const dataUrl=`data:${mime};base64,${data.toString('base64')}`;
+ fs.unlink(req.file.path,()=>{});
+ if(data.length>2*1024*1024)return res.status(400).json({error:'Profile photo must be 2 MB or smaller'});
+ const r=await q('UPDATE users SET profile_photo=$1,updated_at=NOW() WHERE id=$2 RETURNING id,name,email,phone,role,profile_photo,address,created_at',[dataUrl,req.user.id]);
+ res.json({user:safeUser(r.rows[0])});
+}catch(e){res.status(400).json({error:e.message})}});
+
+app.put('/api/auth/change-password',auth,async(req,res)=>{try{
+ const current=String(req.body.currentPassword||''), next=String(req.body.newPassword||''); if(next.length<6)return res.status(400).json({error:'New password must be at least 6 characters'});
+ const r=await q('SELECT password_hash FROM users WHERE id=$1',[req.user.id]); if(!r.rows[0]||!(await bcrypt.compare(current,r.rows[0].password_hash)))return res.status(400).json({error:'Current password is incorrect'});
+ const hash=await bcrypt.hash(next,12); await q('UPDATE users SET password_hash=$1,updated_at=NOW() WHERE id=$2',[hash,req.user.id]); res.json({ok:true,message:'Password changed successfully'});
+}catch(e){res.status(400).json({error:e.message})}});
 
 app.get('/api/products',async(req,res)=>{try{const {search='',category='All',sort='new'}=req.query;let sql=`SELECT p.*,u.name seller_name FROM products p JOIN users u ON u.id=p.seller_id WHERE p.active=true`;const params=[];if(search){params.push('%'+search+'%');sql+=` AND (p.name ILIKE $${params.length} OR p.description ILIKE $${params.length})`}if(category&&category!=='All'){params.push(category);sql+=` AND p.category=$${params.length}`}sql+=sort==='priceLow'?' ORDER BY p.price ASC':sort==='priceHigh'?' ORDER BY p.price DESC':' ORDER BY p.created_at DESC';const r=await q(sql,params);res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/products/:id',async(req,res)=>{const r=await q('SELECT p.*,u.name seller_name FROM products p JOIN users u ON u.id=p.seller_id WHERE p.id=$1 AND p.active=true',[req.params.id]);if(!r.rows[0])return res.status(404).json({error:'Product not found'});res.json(r.rows[0])});
