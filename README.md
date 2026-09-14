@@ -31,3 +31,29 @@ Build command: `npm install`
 Start command: `npm start`
 
 For production, move product images from local `public/uploads` to persistent/object storage and add a real payment gateway, email/SMS notifications, HTTPS, rate limiting, admin moderation and backups before accepting real payments.
+
+
+## Buyer authentication upgrade
+
+This version adds:
+- Buyer profile from the profile button after login
+- Profile photo upload stored in PostgreSQL
+- Name, email, mobile and address management
+- Email-or-mobile + password login
+- Mobile OTP login using Twilio Verify
+- Forgot-password flow using mobile OTP
+- Change-password flow
+
+### Render environment variables
+
+Required:
+- DATABASE_URL
+- JWT_SECRET
+- NODE_ENV=production
+
+For real SMS OTP, also add:
+- TWILIO_ACCOUNT_SID
+- TWILIO_AUTH_TOKEN
+- TWILIO_VERIFY_SERVICE_SID
+
+The server automatically creates/migrates the OTP and user profile columns when it starts.
